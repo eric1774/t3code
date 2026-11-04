@@ -10,6 +10,7 @@ import { writeFileStringAtomically } from "@t3tools/shared/atomicWrite";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -36,6 +37,7 @@ export class SessionBriefService extends Context.Service<
     ) => Effect.Effect<{ count: number; log: SessionBriefLogState }, SessionBriefError>;
     readonly subscribe: (threadId: ThreadId) => Stream.Stream<SessionBriefView, SessionBriefError>;
     readonly clear: (threadId: ThreadId) => Effect.Effect<{ cleared: number }, SessionBriefError>;
+    /** An entry that is not in this thread's brief changes nothing and gives `removedSbId: null`. */
     readonly remove: (
       threadId: ThreadId,
       entryId: string,
@@ -43,11 +45,19 @@ export class SessionBriefService extends Context.Service<
   }
 >()("t3/sessionBrief/SessionBriefService") {}
 
+// `ownSbId` is the last SB id this entry wrote; it outlives a failed check so the id can be
+// recognised (and removed) again, also after a restart. It never leaves the server.
+const StoredEntry = Schema.Struct({
+  ...SessionBriefEntry.fields,
+  ownSbId: Schema.optional(Schema.String),
+});
+type StoredEntry = typeof StoredEntry.Type;
+
 const StoreFile = Schema.fromJsonString(
   Schema.Struct({
     version: Schema.Literal(1),
     rootThreadId: ThreadId,
-    entries: Schema.Array(SessionBriefEntry),
+    entries: Schema.Array(StoredEntry),
   }),
 );
 
@@ -64,9 +74,19 @@ const briefError = (message: string) => (cause: unknown) =>
     message: `${message}: ${cause instanceof Error ? cause.message : String(cause)}`,
   });
 
-// Cleared entries stay stored only while their log write is still in flight.
 const isUnsettled = (log: SessionBriefLogState) =>
   log._tag === "Pending" || log._tag === "Retrying";
+
+const withLog = (entry: StoredEntry, state: SessionBriefLogState): StoredEntry => ({
+  ...entry,
+  log: state,
+  ...(state._tag === "Logged" ? { ownSbId: state.sbId } : {}),
+});
+
+const toEntry = ({ ownSbId: _ownSbId, ...entry }: StoredEntry): SessionBriefEntry => entry;
+
+const visibleCount = (entries: ReadonlyArray<StoredEntry>) =>
+  entries.filter((entry) => !entry.cleared).length;
 
 export const layer = Layer.effect(
   SessionBriefService,
@@ -81,7 +101,7 @@ export const layer = Layer.effect(
 
     const storeDir = path.join(config.stateDir, "session-briefs");
     const storePath = (rootThreadId: ThreadId) => path.join(storeDir, `${rootThreadId}.json`);
-    const briefs = new Map<ThreadId, ReadonlyArray<SessionBriefEntry>>();
+    const briefs = new Map<ThreadId, ReadonlyArray<StoredEntry>>();
     const changes = new Map<ThreadId, PubSub.PubSub<void>>();
     const retries = new Map<string, Fiber.Fiber<void>>();
     // One lock for every brief keeps read-modify-write of a store file from losing entries.
@@ -118,32 +138,47 @@ export const layer = Layer.effect(
       return created;
     });
 
+    // Callers hold `lock`. A cleared entry stays stored until its log state is final and its
+    // retry fiber is gone, so a re-append found after the clear still survives a restart.
+    const save = Effect.fn("SessionBriefService.save")(function* (
+      rootThreadId: ThreadId,
+      next: ReadonlyArray<StoredEntry>,
+    ) {
+      const entries = next.filter(
+        (entry) => !entry.cleared || isUnsettled(entry.log) || retries.has(entry.id),
+      );
+      const contents = yield* encodeStoreFile({ version: 1, rootThreadId, entries }).pipe(
+        Effect.mapError(briefError("Could not encode session brief")),
+      );
+      yield* writeFileStringAtomically({ filePath: storePath(rootThreadId), contents }).pipe(
+        Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.provideService(Path.Path, path),
+        Effect.mapError(briefError("Could not save session brief")),
+      );
+      briefs.set(rootThreadId, entries);
+      yield* PubSub.publish(yield* changesFor(rootThreadId), undefined);
+      return entries;
+    });
+
     const update = <A>(
       rootThreadId: ThreadId,
-      f: (entries: ReadonlyArray<SessionBriefEntry>) => {
-        readonly entries: ReadonlyArray<SessionBriefEntry>;
+      f: (entries: ReadonlyArray<StoredEntry>) => {
+        readonly entries: ReadonlyArray<StoredEntry>;
         readonly result: A;
       },
     ) =>
       lock.withPermits(1)(
         Effect.gen(function* () {
           const next = f(yield* load(rootThreadId));
-          const entries = next.entries.filter((entry) => !entry.cleared || isUnsettled(entry.log));
-          const contents = yield* encodeStoreFile({
-            version: 1,
-            rootThreadId,
-            entries,
-          }).pipe(Effect.mapError(briefError("Could not encode session brief")));
-          yield* writeFileStringAtomically({ filePath: storePath(rootThreadId), contents }).pipe(
-            Effect.provideService(FileSystem.FileSystem, fs),
-            Effect.provideService(Path.Path, path),
-            Effect.mapError(briefError("Could not save session brief")),
-          );
-          briefs.set(rootThreadId, entries);
-          yield* PubSub.publish(yield* changesFor(rootThreadId), undefined);
+          yield* save(rootThreadId, next.entries);
           return next.result;
         }),
       );
+
+    const findEntry = (rootThreadId: ThreadId, entryId: string) =>
+      lock
+        .withPermits(1)(load(rootThreadId))
+        .pipe(Effect.map((entries) => entries.find((entry) => entry.id === entryId)));
 
     const viewOf = (rootThreadId: ThreadId) =>
       lock
@@ -151,7 +186,7 @@ export const layer = Layer.effect(
         .pipe(
           Effect.map((entries): SessionBriefView => ({
             rootThreadId,
-            entries: entries.filter((entry) => !entry.cleared),
+            entries: entries.filter((entry) => !entry.cleared).map(toEntry),
           })),
         );
 
@@ -177,32 +212,37 @@ export const layer = Layer.effect(
       return current;
     });
 
-    const setLog = (rootThreadId: ThreadId, entryId: string, state: SessionBriefLogState) =>
-      update(rootThreadId, (entries) => ({
-        entries: entries.map((entry) => (entry.id === entryId ? { ...entry, log: state } : entry)),
-        result: undefined,
-      }));
-
-    // Runs until the entry settles; it keeps going after a clear prunes the entry from the store.
-    const driveLog = Effect.fn("SessionBriefService.driveLog")(function* (input: {
+    interface Drive {
       readonly rootThreadId: ThreadId;
       readonly entryId: string;
       readonly fields: SessionBriefFields;
       readonly meta: Effect.Effect<{ readonly sessionId: string; readonly sessionTitle: string }>;
       readonly state: SessionBriefLogState;
-    }) {
+      readonly ownSbId: string | undefined;
+    }
+
+    // Runs until the entry settles or leaves the store.
+    const driveLog = Effect.fn("SessionBriefService.driveLog")(function* (input: Drive) {
       const meta = yield* input.meta;
+      // Returns false once the entry is gone, which ends the loop.
       const record = (state: SessionBriefLogState) =>
-        setLog(input.rootThreadId, input.entryId, state).pipe(
+        update(input.rootThreadId, (entries) => ({
+          entries: entries.map((entry) =>
+            entry.id === input.entryId ? withLog(entry, state) : entry,
+          ),
+          result: entries.some((entry) => entry.id === input.entryId),
+        })).pipe(
           Effect.catch((error) =>
-            Effect.logWarning("Could not save session brief log state.", { error }),
+            Effect.logWarning("Could not save session brief log state.", { error }).pipe(
+              Effect.as(true),
+            ),
           ),
         );
       let state = input.state;
       let attempts = state._tag === "Retrying" ? state.attempts : 0;
       let delay = FIRST_RETRY_DELAY;
-      // The SB id the entry held before a failed check: the log returning it means it is still ours.
-      let ownSbId: string | null = null;
+      // The log returning this entry's own last SB id as "already logged" means it is still ours.
+      let ownSbId = input.ownSbId ?? null;
       // Uninterruptible so remove never cancels between a log write and recording its SB id.
       const attempt = Effect.uninterruptible(
         Effect.gen(function* () {
@@ -214,38 +254,57 @@ export const layer = Layer.effect(
             attempts += 1;
             next = { ...next, attempts };
           }
-          yield* record(next);
-          return next;
+          return { next, present: yield* record(next) };
         }),
       );
 
       while (true) {
+        let present = true;
         if (state._tag === "Pending") {
-          state = yield* attempt;
+          ({ next: state, present } = yield* attempt);
         } else if (state._tag === "Logged") {
+          ownSbId = state.sbId;
           delay = FIRST_RETRY_DELAY;
           yield* Effect.sleep(VERIFY_DELAY);
           if (yield* log.verify(state.sbId, input.fields, meta.sessionId)) return;
-          ownSbId = state.sbId;
           attempts += 1;
-          yield* record({ _tag: "Retrying", reason: OVERWRITTEN, attempts });
-          state = yield* attempt;
+          if (!(yield* record({ _tag: "Retrying", reason: OVERWRITTEN, attempts }))) return;
+          ({ next: state, present } = yield* attempt);
         } else if (state._tag === "Retrying") {
           yield* Effect.sleep(delay);
           delay = Duration.min(Duration.times(delay, 2), MAX_RETRY_DELAY);
-          state = yield* attempt;
+          ({ next: state, present } = yield* attempt);
         } else {
           return;
         }
+        if (!present) return;
       }
     });
 
-    const startDriving = (input: Parameters<typeof driveLog>[0]) =>
-      driveLog(input).pipe(
-        Effect.ensuring(Effect.sync(() => retries.delete(input.entryId))),
+    // A cleared entry waits for its fiber to end before it may be pruned.
+    const pruneSettled = (rootThreadId: ThreadId, entryId: string) =>
+      briefs.get(rootThreadId)?.some((entry) => entry.id === entryId && entry.cleared)
+        ? update(rootThreadId, (entries) => ({ entries, result: undefined })).pipe(
+            Effect.catch((error) => Effect.logWarning("Could not prune session brief.", { error })),
+          )
+        : Effect.void;
+
+    const startDriving = Effect.fn("SessionBriefService.startDriving")(function* (input: Drive) {
+      // The fiber waits until it is registered, so its own cleanup always finds it.
+      const registered = yield* Deferred.make<void>();
+      const fiber = yield* Deferred.await(registered).pipe(
+        Effect.andThen(driveLog(input)),
+        Effect.ensuring(
+          Effect.suspend(() => {
+            retries.delete(input.entryId);
+            return pruneSettled(input.rootThreadId, input.entryId);
+          }),
+        ),
         Effect.forkIn(scope),
-        Effect.tap((fiber) => Effect.sync(() => retries.set(input.entryId, fiber))),
       );
+      retries.set(input.entryId, fiber);
+      yield* Deferred.succeed(registered, undefined);
+    });
 
     const add = Effect.fn("SessionBriefService.add")(function* (
       callerThreadId: ThreadId,
@@ -254,7 +313,7 @@ export const layer = Layer.effect(
       const rootThreadId = yield* resolveRoot(callerThreadId);
       const rootShell = yield* shellOf(rootThreadId);
       const meta = { sessionId: rootThreadId, sessionTitle: rootShell?.title ?? rootThreadId };
-      const entry: SessionBriefEntry = {
+      const entry: StoredEntry = {
         ...fields,
         id: yield* random.uuidV4(),
         createdAt: DateTime.formatIso(yield* DateTime.now),
@@ -267,20 +326,40 @@ export const layer = Layer.effect(
       const appended = yield* log.append(fields, meta);
       const state: SessionBriefLogState =
         appended._tag === "Retrying" ? { ...appended, attempts: 1 } : appended;
-      const count = yield* update(rootThreadId, (entries) => {
-        const next = entries.map((item) => (item.id === entry.id ? { ...item, log: state } : item));
-        return { entries: next, result: next.filter((item) => !item.cleared).length };
-      });
-      if (state._tag === "Logged" || state._tag === "Retrying") {
-        yield* startDriving({
-          rootThreadId,
-          entryId: entry.id,
-          fields,
-          meta: Effect.succeed(meta),
-          state,
-        });
+      // Decided under the lock: a remove that ran during the append must not get a fiber.
+      const outcome = yield* lock.withPermits(1)(
+        Effect.gen(function* () {
+          const entries = yield* load(rootThreadId);
+          if (!entries.some((item) => item.id === entry.id)) {
+            return { count: visibleCount(entries), present: false };
+          }
+          if (state._tag === "Logged" || state._tag === "Retrying") {
+            yield* startDriving({
+              rootThreadId,
+              entryId: entry.id,
+              fields,
+              meta: Effect.succeed(meta),
+              state,
+              ownSbId: undefined,
+            });
+          }
+          const next = yield* save(
+            rootThreadId,
+            entries.map((item) => (item.id === entry.id ? withLog(item, state) : item)),
+          );
+          return { count: visibleCount(next), present: true };
+        }),
+      );
+      if (!outcome.present && state._tag === "Logged") {
+        const removal = yield* log.remove(state.sbId, fields);
+        if (removal._tag === "Unavailable") {
+          yield* Effect.logWarning("Could not take a removed brief entry back out of the log.", {
+            sbId: state.sbId,
+            reason: removal.reason,
+          });
+        }
       }
-      return { count, log: state };
+      return { count: outcome.count, log: state };
     });
 
     const subscribe = (threadId: ThreadId) =>
@@ -302,26 +381,57 @@ export const layer = Layer.effect(
       const rootThreadId = yield* resolveRoot(threadId);
       const cleared = yield* update(rootThreadId, (entries) => ({
         entries: entries.map((entry) => (entry.cleared ? entry : { ...entry, cleared: true })),
-        result: entries.filter((entry) => !entry.cleared).length,
+        result: visibleCount(entries),
       }));
       return { cleared };
     });
+
+    const titleMeta = (rootThreadId: ThreadId) =>
+      shellOf(rootThreadId).pipe(
+        Effect.map((shell) => ({
+          sessionId: rootThreadId,
+          sessionTitle: shell?.title ?? rootThreadId,
+        })),
+        Effect.orElseSucceed(() => ({ sessionId: rootThreadId, sessionTitle: rootThreadId })),
+      );
 
     const remove = Effect.fn("SessionBriefService.remove")(function* (
       threadId: ThreadId,
       entryId: string,
     ) {
       const rootThreadId = yield* resolveRoot(threadId);
+      if ((yield* findEntry(rootThreadId, entryId)) === undefined) return { removedSbId: null };
       const fiber = retries.get(entryId);
       if (fiber !== undefined) yield* Fiber.interrupt(fiber);
-      const entry = (yield* lock.withPermits(1)(load(rootThreadId))).find(
-        (item) => item.id === entryId,
-      );
+      // Re-read: the interrupted fiber may have recorded a final state.
+      const entry = yield* findEntry(rootThreadId, entryId);
       if (entry === undefined) return { removedSbId: null };
-      const removedSbId =
-        entry.log._tag === "Logged" && (yield* log.remove(entry.log.sbId, entry))
+      const sbId =
+        entry.log._tag === "Logged"
           ? entry.log.sbId
-          : null;
+          : isUnsettled(entry.log)
+            ? (entry.ownSbId ?? null)
+            : null;
+      let removedSbId: string | null = null;
+      if (sbId !== null) {
+        const removal = yield* log.remove(sbId, entry);
+        if (removal._tag === "Unavailable") {
+          if (fiber !== undefined) {
+            yield* startDriving({
+              rootThreadId,
+              entryId,
+              fields: entry,
+              meta: titleMeta(rootThreadId),
+              state: entry.log,
+              ownSbId: entry.ownSbId,
+            });
+          }
+          return yield* new SessionBriefError({
+            message: `Couldn't remove it from the annual log: ${removal.reason}. Try again.`,
+          });
+        }
+        if (removal._tag === "Removed") removedSbId = sbId;
+      }
       yield* update(rootThreadId, (entries) => ({
         entries: entries.filter((item) => item.id !== entryId),
         result: undefined,
@@ -348,14 +458,9 @@ export const layer = Layer.effect(
             rootThreadId,
             entryId: entry.id,
             fields: entry,
-            meta: shellOf(rootThreadId).pipe(
-              Effect.map((shell) => ({
-                sessionId: rootThreadId,
-                sessionTitle: shell?.title ?? rootThreadId,
-              })),
-              Effect.orElseSucceed(() => ({ sessionId: rootThreadId, sessionTitle: rootThreadId })),
-            ),
+            meta: titleMeta(rootThreadId),
             state: entry.log,
+            ownSbId: entry.ownSbId,
           });
         }
       }

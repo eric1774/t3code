@@ -203,9 +203,14 @@ it.effect("remove takes the entry back out", () =>
     Effect.gen(function* () {
       const state = yield* service.append(fieldsA, meta);
       const sbId = state._tag === "Logged" ? state.sbId : "";
-      assert.isTrue(yield* service.remove(sbId, fieldsA));
+      assert.deepStrictEqual(yield* service.remove(sbId, fieldsA), { _tag: "Removed" });
       assert.deepStrictEqual(parseVaultLog(yield* fs.readFileString(file)).entries, []);
-      assert.isFalse(yield* service.remove(sbId, fieldsA));
+      assert.deepStrictEqual(yield* service.remove(sbId, fieldsA), { _tag: "NotFound" });
+      yield* fs.writeFileString(file, "{ not json");
+      assert.deepStrictEqual(yield* service.remove(sbId, fieldsA), {
+        _tag: "Unavailable",
+        reason: "log file is not valid JSON",
+      });
     }),
   ),
 );

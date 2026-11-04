@@ -19,6 +19,11 @@ import {
   type VaultLog,
 } from "./briefLog.ts";
 
+export type SessionBriefLogRemoval =
+  | { readonly _tag: "Removed" }
+  | { readonly _tag: "NotFound" }
+  | { readonly _tag: "Unavailable"; readonly reason: string };
+
 export class SessionBriefLog extends Context.Service<
   SessionBriefLog,
   {
@@ -32,7 +37,11 @@ export class SessionBriefLog extends Context.Service<
       fields: SessionBriefFields,
       sessionId: string,
     ) => Effect.Effect<boolean>;
-    readonly remove: (sbId: string, fields: SessionBriefFields) => Effect.Effect<boolean>;
+    /** Never fails: a log that cannot be read or written is `Unavailable`. */
+    readonly remove: (
+      sbId: string,
+      fields: SessionBriefFields,
+    ) => Effect.Effect<SessionBriefLogRemoval>;
   }
 >()("t3/sessionBrief/SessionBriefLog") {}
 
@@ -139,16 +148,23 @@ export const layer = Layer.effect(
     ) {
       return yield* Effect.gen(function* () {
         const filePath = yield* logPath;
-        if (filePath === "") return false;
+        if (filePath === "") {
+          return { _tag: "Unavailable", reason: "no log path set in Settings" } as const;
+        }
         return yield* lock.withPermits(1)(
           Effect.gen(function* () {
             const result = removeFromVaultLog(yield* readLog(filePath), sbId, fields);
-            if (!result.removed) return false;
+            if (!result.removed) return { _tag: "NotFound" } as const;
             yield* writeLog(filePath, result.log, yield* now);
-            return true;
+            return { _tag: "Removed" } as const;
           }),
         );
-      }).pipe(Effect.orElseSucceed(() => false));
+      }).pipe(
+        Effect.catchTags({
+          LogUnavailable: (error) =>
+            Effect.succeed({ _tag: "Unavailable", reason: error.reason } as const),
+        }),
+      );
     });
 
     return SessionBriefLog.of({ append, verify, remove });

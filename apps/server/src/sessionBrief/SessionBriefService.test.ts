@@ -1,7 +1,9 @@
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -79,8 +81,55 @@ const watchViews = (service: SessionBriefService["Service"], threadId: ThreadId)
           if (predicate(view)) return view;
         }
       });
-    return { next, until };
+    /** Like `until`, but checks the store file after each change. */
+    const untilStored = (
+      fs: FileSystem.FileSystem,
+      file: string,
+      predicate: (stored: StoredBrief) => boolean,
+    ) =>
+      Effect.gen(function* () {
+        while (true) {
+          yield* next;
+          const stored: StoredBrief = JSON.parse(yield* fs.readFileString(file));
+          if (predicate(stored)) return stored;
+        }
+      });
+    return { next, until, untilStored };
   });
+
+interface StoredBrief {
+  readonly entries: ReadonlyArray<SessionBriefEntry & { readonly ownSbId?: string }>;
+}
+
+const restartedEntryId = "0b6f8a47-3c1e-4a8e-9c55-0f6e2f4d8c11";
+const writeStore =
+  (entries: ReadonlyArray<Record<string, unknown>>) =>
+  (input: {
+    readonly fs: FileSystem.FileSystem;
+    readonly storeFile: (rootThreadId: string) => string;
+  }) =>
+    input.fs
+      .makeDirectory(input.storeFile(root).replace(/[\\/][^\\/]+$/, ""), { recursive: true })
+      .pipe(
+        Effect.andThen(
+          input.fs.writeFileString(
+            input.storeFile(root),
+            JSON.stringify({ version: 1, rootThreadId: root, entries }),
+          ),
+        ),
+      );
+const restartedEntry = (fields: Record<string, unknown>) => ({
+  ...fieldsA,
+  id: restartedEntryId,
+  createdAt: "2026-11-04T10:00:00.000Z",
+  sourceThreadId: root,
+  cleared: false,
+  ...fields,
+});
+const ownLogEntry = (id: string) => ({
+  ...logEntry(id, fieldsA.topic, fieldsA.changed, "t3"),
+  session_id: root,
+});
 
 const readLogIds = (fs: FileSystem.FileSystem, logFile: string) =>
   fs
@@ -94,6 +143,9 @@ const harness = <A, E>(
       readonly fs: FileSystem.FileSystem;
       readonly storeFile: (rootThreadId: string) => string;
     }) => Effect.Effect<void, PlatformError.PlatformError>;
+    readonly wrapLog?: (
+      log: SessionBriefLog.SessionBriefLog["Service"],
+    ) => SessionBriefLog.SessionBriefLog["Service"];
   },
   body: (harness: {
     readonly service: SessionBriefService["Service"];
@@ -120,7 +172,14 @@ const harness = <A, E>(
     const layer = sessionBriefLayer.pipe(
       Layer.provide(
         Layer.mergeAll(
-          SessionBriefLog.layer.pipe(
+          Layer.effect(
+            SessionBriefLog.SessionBriefLog,
+            Effect.gen(function* () {
+              const log = yield* SessionBriefLog.SessionBriefLog;
+              return options.wrapLog ? options.wrapLog(log) : log;
+            }),
+          ).pipe(
+            Layer.provide(SessionBriefLog.layer),
             Layer.provide(ServerSettingsService.layerTest({ sessionBriefLogPath: logFile })),
           ),
           Layer.succeed(ServerConfig, config),
@@ -272,7 +331,13 @@ it.effect("clear keeps retrying hidden entry until it lands, then prunes it", ()
       assert.strictEqual((yield* views.next).entries.length, 0);
       yield* fs.writeFileString(logFile, seed());
       yield* TestClock.adjust("5 seconds");
-      assert.strictEqual((yield* views.next).entries.length, 0);
+      yield* views.untilStored(
+        fs,
+        storeFile(root),
+        (brief) => brief.entries[0]?.log._tag === "Logged",
+      );
+      yield* TestClock.adjust("2 seconds");
+      yield* views.untilStored(fs, storeFile(root), (brief) => brief.entries.length === 0);
       assert.deepStrictEqual(yield* logIds, ["SB-0001"]);
       const pruned = JSON.parse(yield* fs.readFileString(storeFile(root)));
       assert.deepStrictEqual(pruned, { version: 1, rootThreadId: root, entries: [] });
@@ -310,28 +375,9 @@ it.effect("resumes pending entries on restart", () =>
   harness(
     {
       log: seed(),
-      before: ({ fs, storeFile }) =>
-        fs.makeDirectory(storeFile(root).replace(/[\\/][^\\/]+$/, ""), { recursive: true }).pipe(
-          Effect.andThen(
-            fs.writeFileString(
-              storeFile(root),
-              JSON.stringify({
-                version: 1,
-                rootThreadId: root,
-                entries: [
-                  {
-                    ...fieldsA,
-                    id: "0b6f8a47-3c1e-4a8e-9c55-0f6e2f4d8c11",
-                    createdAt: "2026-11-04T10:00:00.000Z",
-                    sourceThreadId: root,
-                    cleared: false,
-                    log: { _tag: "Retrying", reason: "log file not found", attempts: 3 },
-                  },
-                ],
-              }),
-            ),
-          ),
-        ),
+      before: writeStore([
+        restartedEntry({ log: { _tag: "Retrying", reason: "log file not found", attempts: 3 } }),
+      ]),
     },
     ({ logIds, watch }) =>
       Effect.gen(function* () {
@@ -340,5 +386,140 @@ it.effect("resumes pending entries on restart", () =>
         yield* views.until(isLog("Logged", "SB-0001"));
         assert.deepStrictEqual(yield* logIds, ["SB-0001"]);
       }),
+  ),
+);
+
+const overwrittenBeforeRestart = writeStore([
+  restartedEntry({
+    log: { _tag: "Retrying", reason: "overwritten by another writer", attempts: 1 },
+    ownSbId: "SB-0001",
+  }),
+]);
+
+it.effect("keeps its own SB id across a restart", () =>
+  harness(
+    { log: seed([ownLogEntry("SB-0001")]), before: overwrittenBeforeRestart },
+    ({ logIds, watch }) =>
+      Effect.gen(function* () {
+        const views = yield* watch(root);
+        yield* TestClock.adjust("5 seconds");
+        yield* views.until(isLog("Logged", "SB-0001"));
+        assert.deepStrictEqual(yield* logIds, ["SB-0001"]);
+      }),
+  ),
+);
+
+it.effect("remove after a restart uses the stored SB id", () =>
+  harness(
+    { log: seed([ownLogEntry("SB-0001")]), before: overwrittenBeforeRestart },
+    ({ service, logIds }) =>
+      Effect.gen(function* () {
+        assert.deepStrictEqual(yield* service.remove(root, restartedEntryId), {
+          removedSbId: "SB-0001",
+        });
+        assert.deepStrictEqual(yield* logIds, []);
+      }),
+  ),
+);
+
+it.effect("remove during the first log write leaves no log record", () => {
+  const appendStarted = Deferred.makeUnsafe<void>();
+  const releaseAppend = Deferred.makeUnsafe<void>();
+  return harness(
+    {
+      log: seed(),
+      wrapLog: (log) => ({
+        ...log,
+        append: (fields, meta) =>
+          Deferred.succeed(appendStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseAppend)),
+            Effect.andThen(log.append(fields, meta)),
+          ),
+      }),
+    },
+    ({ service, logIds }) =>
+      Effect.gen(function* () {
+        const adding = yield* Effect.forkChild(service.add(root, fieldsA));
+        yield* Deferred.await(appendStarted);
+        const [pending] = Option.getOrThrow(yield* Stream.runHead(service.subscribe(root))).entries;
+        assert.deepStrictEqual(pending?.log, { _tag: "Pending" });
+        assert.deepStrictEqual(yield* service.remove(root, pending!.id), { removedSbId: null });
+        yield* Deferred.succeed(releaseAppend, undefined);
+        yield* Fiber.join(adding);
+        assert.deepStrictEqual(yield* logIds, []);
+        yield* TestClock.adjust("10 seconds");
+        assert.deepStrictEqual(yield* logIds, []);
+        const view = Option.getOrThrow(yield* Stream.runHead(service.subscribe(root)));
+        assert.strictEqual(view.entries.length, 0);
+      }),
+  );
+});
+
+it.effect("remove keeps the entry when the log cannot be read", () =>
+  harness({ log: seed() }, ({ service, fs, logFile }) =>
+    Effect.gen(function* () {
+      yield* service.add(root, fieldsA);
+      yield* fs.writeFileString(logFile, "{ half written");
+      const [entry] = Option.getOrThrow(yield* Stream.runHead(service.subscribe(root))).entries;
+      const failure = yield* Effect.flip(service.remove(root, entry!.id));
+      assert.strictEqual(
+        failure.message,
+        "Couldn't remove it from the annual log: log file is not valid JSON. Try again.",
+      );
+      const view = Option.getOrThrow(yield* Stream.runHead(service.subscribe(root)));
+      assert.deepStrictEqual(JSON.stringify(view.entries), JSON.stringify([entry]));
+    }),
+  ),
+);
+
+it.effect("remove drops the entry when its SB id is no longer in the log", () =>
+  harness({ log: seed() }, ({ service, fs, logFile }) =>
+    Effect.gen(function* () {
+      yield* service.add(root, fieldsA);
+      yield* fs.writeFileString(logFile, seed());
+      const [entry] = Option.getOrThrow(yield* Stream.runHead(service.subscribe(root))).entries;
+      assert.deepStrictEqual(yield* service.remove(root, entry!.id), { removedSbId: null });
+      const view = Option.getOrThrow(yield* Stream.runHead(service.subscribe(root)));
+      assert.strictEqual(view.entries.length, 0);
+    }),
+  ),
+);
+
+it.effect("remove from another brief changes nothing", () =>
+  harness({ log: null }, ({ service, fs, logFile, watch }) =>
+    Effect.gen(function* () {
+      yield* service.add(root, fieldsA);
+      const [entry] = Option.getOrThrow(yield* Stream.runHead(service.subscribe(root))).entries;
+      assert.deepStrictEqual(yield* service.remove(fork, entry!.id), { removedSbId: null });
+      const views = yield* watch(root);
+      yield* fs.writeFileString(logFile, seed());
+      yield* TestClock.adjust("5 seconds");
+      yield* views.until(isLog("Logged", "SB-0001"));
+    }),
+  ),
+);
+
+it.effect("cleared entry re-appends after an overwrite and stays stored until it lands", () =>
+  harness({ log: seed() }, ({ service, fs, logFile, logIds, storeFile, watch }) =>
+    Effect.gen(function* () {
+      assert.deepStrictEqual((yield* service.add(root, fieldsA)).log, {
+        _tag: "Logged",
+        sbId: "SB-0001",
+      });
+      assert.deepStrictEqual(yield* service.clear(root), { cleared: 1 });
+      const stored: StoredBrief = JSON.parse(yield* fs.readFileString(storeFile(root)));
+      assert.strictEqual(stored.entries.length, 1);
+      yield* fs.writeFileString(logFile, seed([logEntry("SB-0001", "theirs", "theirs")]));
+      const views = yield* watch(root);
+      yield* TestClock.adjust("2 seconds");
+      const relogged = yield* views.untilStored(fs, storeFile(root), (brief) => {
+        const log = brief.entries[0]?.log;
+        return log?._tag === "Logged" && log.sbId === "SB-0002";
+      });
+      assert.strictEqual(relogged.entries[0]?.cleared, true);
+      yield* TestClock.adjust("2 seconds");
+      yield* views.untilStored(fs, storeFile(root), (brief) => brief.entries.length === 0);
+      assert.deepStrictEqual(yield* logIds, ["SB-0001", "SB-0002"]);
+    }),
   ),
 );
