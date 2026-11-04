@@ -21,6 +21,7 @@ import type {
   ProjectId,
   PullRequestState,
   ResolvedKeybindingsConfig,
+  ScopedThreadRef,
   ThreadId,
 } from "@t3tools/contracts";
 import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
@@ -44,6 +45,7 @@ import {
   Files,
   Globe2,
   MessagesSquare,
+  NotebookPen,
   Plus,
   TerminalSquare,
 } from "lucide-react";
@@ -102,6 +104,7 @@ import { previewBridge } from "./preview/previewBridge";
 import { PierreEntryIcon } from "./chat/PierreEntryIcon";
 import { resolvePullRequestState } from "./pullRequest/pullRequestPresentation";
 import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
+import { SessionBriefTabTitle } from "./chat/SessionBriefTabTitle";
 import { observeResize } from "~/lib/observeResize";
 import { surfaceShortcutKey } from "~/lib/surfaceShortcutKey";
 
@@ -140,6 +143,7 @@ export interface RightPanelTabsProps {
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddPullRequests: () => void;
+  onAddBrief: () => void;
   onAddDevice: () => void;
   /** Absent where side chats are not offered. */
   onAddSideChat?: (() => void) | undefined;
@@ -149,11 +153,14 @@ export interface RightPanelTabsProps {
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
   pullRequestsAvailable: boolean;
+  briefAvailable: boolean;
   deviceAvailable: boolean;
   sideChatAvailable?: boolean;
   /** Overrides the default reason while side chats are available but cannot start. */
   sideChatDisabledReason?: string | null;
   pullRequestStatusSeeds?: Readonly<Record<string, PullRequestTabStatusSeed>>;
+  /** Thread whose brief the Brief tab counts; the tab says only "Brief" without it. */
+  briefThreadRef?: ScopedThreadRef | null;
   children: ReactNode;
 }
 
@@ -178,6 +185,7 @@ const SURFACE_DISABLED_REASONS = {
   diff: "Diff is only available for server threads in Git repositories.",
   pullRequest: "This thread's branch has no pull request yet.",
   pullRequests: "No linked pull requests are available for this thread.",
+  brief: "The brief is only available from a thread.",
   device: "Devices are only available from a thread.",
   sideChat: "Side chats start after the first message.",
 } as const;
@@ -203,6 +211,7 @@ const SURFACE_UNAVAILABLE_HINTS = {
   diff: "Available for Git repositories.",
   pullRequest: "No pull request on this branch yet.",
   pullRequests: "No linked pull requests available.",
+  brief: "Available from a thread.",
   device: "Available from a thread.",
   sideChat: "Available after the first message.",
 } as const;
@@ -321,6 +330,7 @@ function RightPanelEmptyState(props: {
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddPullRequests: () => void;
+  onAddBrief: () => void;
   onAddDevice: () => void;
   /** Absent where side chats are not offered. */
   onAddSideChat?: (() => void) | undefined;
@@ -330,6 +340,7 @@ function RightPanelEmptyState(props: {
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
   pullRequestsAvailable: boolean;
+  briefAvailable: boolean;
   deviceAvailable: boolean;
   sideChatAvailable: boolean;
   sideChatDisabledReason: string | null;
@@ -384,6 +395,15 @@ function RightPanelEmptyState(props: {
       available: props.pullRequestsAvailable,
       disabledReason: SURFACE_UNAVAILABLE_HINTS.pullRequests,
       onClick: props.onAddPullRequests,
+    },
+    {
+      label: "Brief",
+      description: "Verified steps the agent logs, ready to paste into a ticket.",
+      icon: NotebookPen,
+      shortcut: "N",
+      available: props.briefAvailable,
+      disabledReason: SURFACE_UNAVAILABLE_HINTS.brief,
+      onClick: props.onAddBrief,
     },
     {
       label: "Device",
@@ -590,6 +610,8 @@ function surfaceTitle(
       return `#${surface.number}`;
     case "pull-requests":
       return "Pull requests";
+    case "brief":
+      return "Brief";
     case "device":
       return surface.title ?? surface.target?.name ?? "Device";
     case "side-chat":
@@ -682,6 +704,8 @@ function SurfaceIcon({
       );
     case "pull-requests":
       return <PullRequestGlyph.link className="size-3 shrink-0" />;
+    case "brief":
+      return <NotebookPen className="size-3 shrink-0" />;
     case "side-chat":
       return <SideChatTabIcon environmentId={environmentId} threadId={surface.threadId} />;
     case "device":
@@ -880,6 +904,7 @@ function RightPanelTab(
     theme: "light" | "dark";
     environmentId: EnvironmentId | null;
     pullRequestStatusSeed: PullRequestTabStatusSeed | undefined;
+    briefThreadRef: ScopedThreadRef | null;
     renaming: boolean;
     canRename: boolean;
     ownsDesktopTitleBar: boolean;
@@ -979,7 +1004,11 @@ function RightPanelTab(
                 aria-label={sideChatState === null ? undefined : `${title}, ${sideChatState}`}
                 onClick={() => onActivate(surface)}
               >
-                <span className="truncate">{title}</span>
+                {surface.kind === "brief" && props.briefThreadRef !== null ? (
+                  <SessionBriefTabTitle threadRef={props.briefThreadRef} />
+                ) : (
+                  <span className="truncate">{title}</span>
+                )}
               </button>
             }
           />
@@ -1138,6 +1167,14 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       available: props.pullRequestsAvailable,
       disabledReason: SURFACE_DISABLED_REASONS.pullRequests,
       onClick: props.onAddPullRequests,
+    },
+    {
+      label: "Brief",
+      icon: NotebookPen,
+      shortcut: "N",
+      available: props.briefAvailable,
+      disabledReason: SURFACE_DISABLED_REASONS.brief,
+      onClick: props.onAddBrief,
     },
     {
       label: "Device",
@@ -1377,6 +1414,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                     theme={resolvedTheme}
                     environmentId={props.environmentId}
                     pullRequestStatusSeed={props.pullRequestStatusSeeds?.[surface.id]}
+                    briefThreadRef={props.briefThreadRef ?? null}
                     renaming={renamingDevice === surface.id}
                     canRename={props.onRenameDevice !== undefined}
                     ownsDesktopTitleBar={ownsDesktopTitleBar}
@@ -1532,6 +1570,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddFiles={props.onAddFiles}
             onAddPullRequest={props.onAddPullRequest}
             onAddPullRequests={props.onAddPullRequests}
+            onAddBrief={props.onAddBrief}
             onAddDevice={props.onAddDevice}
             onAddSideChat={props.onAddSideChat}
             browserAvailable={props.browserAvailable}
@@ -1540,6 +1579,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             filesAvailable={props.filesAvailable}
             pullRequestAvailable={props.pullRequestAvailable}
             pullRequestsAvailable={props.pullRequestsAvailable}
+            briefAvailable={props.briefAvailable}
             deviceAvailable={props.deviceAvailable}
             sideChatAvailable={props.sideChatAvailable === true}
             sideChatDisabledReason={props.sideChatDisabledReason ?? null}

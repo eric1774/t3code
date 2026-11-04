@@ -1495,6 +1495,7 @@ export function PullRequestsPage() {
             onAddFiles={() => undefined}
             onAddPullRequest={() => undefined}
             onAddPullRequests={() => undefined}
+            onAddBrief={() => undefined}
             onAddDevice={() => undefined}
             browserAvailable={false}
             terminalAvailable={false}
@@ -1502,6 +1503,7 @@ export function PullRequestsPage() {
             filesAvailable={false}
             pullRequestAvailable={false}
             pullRequestsAvailable={false}
+            briefAvailable={false}
             deviceAvailable={false}
             pullRequestStatusSeeds={listedPullRequestTabStatuses}
           >
