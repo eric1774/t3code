@@ -125,6 +125,7 @@ import * as ThreadMessageIntake from "./orchestration-v2/ThreadMessageIntake.ts"
 import * as DocumentText from "./provider/DocumentText.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ScheduledTasks from "./scheduledTasks/ScheduledTaskService.ts";
+import * as SessionBrief from "./sessionBrief/SessionBriefService.ts";
 import * as SecretRequests from "./secrets/SecretRequests.ts";
 import * as GuestShareService from "./guest/GuestShareService.ts";
 import {
@@ -1396,6 +1397,7 @@ export const layerWsRpc = (
       const commandOutputHub = yield* CommandOutputHub.CommandOutputHub;
       const providerSessionManager = yield* ProviderSessionManager.ProviderSessionManagerV2;
       const scheduledTasks = yield* ScheduledTasks.ScheduledTaskService;
+      const sessionBrief = yield* SessionBrief.SessionBriefService;
       const secretRequests = yield* SecretRequests.SecretRequests;
       const guestShares = yield* GuestShareService.GuestShareService;
       const pullRequests = yield* PullRequestService.PullRequestService;
@@ -2273,6 +2275,15 @@ export const layerWsRpc = (
               Effect.as(commandOutputHub.subscribe(input)),
             ),
           ),
+        [WS_METHODS.sessionBriefSubscribe]: (input) =>
+          Stream.unwrap(
+            Effect.annotateCurrentSpan({ "orchestration_v2.thread_id": input.threadId }).pipe(
+              Effect.as(sessionBrief.subscribe(input.threadId)),
+            ),
+          ),
+        [WS_METHODS.sessionBriefClear]: (input) => sessionBrief.clear(input.threadId),
+        [WS_METHODS.sessionBriefRemove]: (input) =>
+          sessionBrief.remove(input.threadId, input.entryId),
         [WS_METHODS.scheduledTasksSubscribe]: (_input) =>
           scheduledTasks.subscribeList().pipe(Stream.map(withVisibleWebhookUrls)),
         [WS_METHODS.scheduledTasksUpsert]: (input) => scheduledTasks.upsert(input),

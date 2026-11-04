@@ -1327,6 +1327,10 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:scheduled-tasks:live",
       tag: WS_METHODS.scheduledTasksSubscribe,
     }),
+    sessionBriefLive: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
+      label: "environment-data:server:session-brief:live",
+      tag: WS_METHODS.sessionBriefSubscribe,
+    }),
     // A cold transcript scan is measured in seconds, so keep the result around
     // long enough that switching windows or re-rendering does not rescan.
     usageSummary: createEnvironmentRpcQueryAtomFamily(runtime, {
@@ -1562,6 +1566,14 @@ export function createServerEnvironmentAtoms<R, E>(
     // Deliberately not on the config lane: run-now blocks until the run is
     // dispatched, and a slow run must not stall settings/keybinding/provider
     // mutations (or other scheduled-task edits) queued behind it.
+    clearSessionBrief: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:session-brief:clear",
+      tag: WS_METHODS.sessionBriefClear,
+    }),
+    removeSessionBriefEntry: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:session-brief:remove",
+      tag: WS_METHODS.sessionBriefRemove,
+    }),
     runScheduledTaskNow: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:scheduled-task:run-now",
       tag: WS_METHODS.scheduledTasksRunNow,

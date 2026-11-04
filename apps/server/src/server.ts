@@ -811,8 +811,6 @@ const layerMakeRoutes = Layer.mergeAll(
     ),
   ),
   Layer.provide(PreviewAutomationBroker.layer),
-  // One instance for /mcp and WebSocket, so both share retry fibers and the change feed.
-  Layer.provide(SessionBriefService.layer.pipe(Layer.provide(SessionBriefLog.layer))),
   Layer.provide(ServerSelfUpdate.layer.pipe(Layer.provide(layerDesktopAppUpdate))),
   Layer.provide(layerCommandReadiness),
   Layer.provide(ServerHttp.layerBrowserApiCors),
@@ -1177,6 +1175,10 @@ const layerMakeServer = Layer.unwrap(
 
     return layerServerApplication.pipe(
       Layer.provide(CloudLink.layer.pipe(Layer.provideMerge(ConnectReachability.layer))),
+      // One instance for /mcp and WebSocket, so both share retry fibers and the change feed.
+      // Merged here (not just provided to the routes) because the WebSocket handlers
+      // read it from the request context.
+      Layer.provideMerge(SessionBriefService.layer.pipe(Layer.provide(SessionBriefLog.layer))),
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(
