@@ -7,6 +7,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Semaphore from "effect/Semaphore";
 
 import { ServerSettingsService } from "../serverSettings.ts";
@@ -45,10 +46,23 @@ export class SessionBriefLog extends Context.Service<
   }
 >()("t3/sessionBrief/SessionBriefLog") {}
 
-const shortReason = (error: unknown) => {
+// Reasons reach the Brief tab badge, so they stay a few words long and never carry a file path.
+const OWN_REASONS = new Set(["log file is not valid JSON", "log has no entries list"]);
+const LOCK_CODES = /\b(EBUSY|EPERM|EACCES)\b/;
+
+export const shortReason = (error: unknown): string => {
+  if (PlatformError.isPlatformError(error)) {
+    const tag = error.reason._tag;
+    const code = String((error.reason.cause as NodeJS.ErrnoException | undefined)?.code ?? "");
+    if (tag === "NotFound" || code === "ENOENT") return "log file not found";
+    if (tag === "Busy" || tag === "PermissionDenied" || LOCK_CODES.test(code)) {
+      return "file locked";
+    }
+    return "log write failed";
+  }
   const message = error instanceof Error ? error.message : String(error);
-  const line = message.split("\n")[0]?.trim() ?? "";
-  return (line === "" ? "unknown error" : line).slice(0, 200);
+  if (OWN_REASONS.has(message)) return message;
+  return LOCK_CODES.test(message) ? "file locked" : "log write failed";
 };
 
 class LogUnavailable extends Data.TaggedError("LogUnavailable")<{ readonly reason: string }> {}
@@ -73,7 +87,7 @@ export const layer = Layer.effect(
         Effect.mapError(
           (error) =>
             new LogUnavailable({
-              reason: error.reason._tag === "NotFound" ? "log file not found" : shortReason(error),
+              reason: shortReason(error),
             }),
         ),
         Effect.flatMap((text) =>

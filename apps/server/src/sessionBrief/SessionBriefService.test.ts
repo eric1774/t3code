@@ -523,3 +523,139 @@ it.effect("cleared entry re-appends after an overwrite and stays stored until it
     }),
   ),
 );
+
+const stateDirOf = (storeFile: (rootThreadId: string) => string) =>
+  storeFile(root).replace(/[\\/]session-briefs[\\/][^\\/]+$/, "");
+
+it.effect("an unsafe thread id names no file outside the store", () =>
+  harness({ log: seed() }, ({ service, fs, storeFile }) =>
+    Effect.gen(function* () {
+      const outside = `${stateDirOf(storeFile)}/x.json`;
+      yield* fs.writeFileString(outside, "keep me");
+      for (const bad of ["../x", "..\\x", "a/b", "a\\b", "x\u0000y", "x".repeat(300)]) {
+        const cleared = yield* Effect.flip(service.clear(ThreadId.make(bad)));
+        assert.strictEqual(cleared.message, "invalid thread id");
+        const read = yield* Effect.flip(Stream.runHead(service.subscribe(ThreadId.make(bad))));
+        assert.strictEqual(read.message, "invalid thread id");
+        const removed = yield* Effect.flip(service.remove(ThreadId.make(bad), "x"));
+        assert.strictEqual(removed.message, "invalid thread id");
+      }
+      assert.strictEqual(yield* fs.readFileString(outside), "keep me");
+      assert.deepStrictEqual(
+        (yield* fs.readDirectory(`${stateDirOf(storeFile)}/session-briefs`)).filter((name) =>
+          name.endsWith(".json"),
+        ),
+        [],
+      );
+    }),
+  ),
+);
+
+it.effect("a thread id with a colon keeps its brief in an encoded file", () =>
+  harness({ log: seed() }, ({ service, fs, storeFile }) =>
+    Effect.gen(function* () {
+      const mcpThread = ThreadId.make("mcp:0b6f8a47-3c1e-4a8e-9c55-0f6e2f4d8c11");
+      yield* service.add(mcpThread, fieldsA);
+      const view = Option.getOrThrow(yield* Stream.runHead(service.subscribe(mcpThread)));
+      assert.strictEqual(view.entries.length, 1);
+      const stored = JSON.parse(
+        yield* fs.readFileString(storeFile("mcp~3A0b6f8a47-3c1e-4a8e-9c55-0f6e2f4d8c11")),
+      );
+      assert.strictEqual(stored.rootThreadId, mcpThread);
+    }),
+  ),
+);
+
+it.effect("clear and remove with nothing to change write no store file", () =>
+  harness({ log: seed() }, ({ service, fs, storeFile }) =>
+    Effect.gen(function* () {
+      const unknown = ThreadId.make("thread-unknown");
+      assert.deepStrictEqual(yield* service.clear(unknown), { cleared: 0 });
+      assert.deepStrictEqual(yield* service.remove(unknown, "missing"), { removedSbId: null });
+      assert.isFalse(yield* fs.exists(storeFile(unknown)));
+    }),
+  ),
+);
+
+it.effect("an unreadable store gives clients a fixed message", () =>
+  harness(
+    {
+      log: seed(),
+      before: ({ fs, storeFile }) =>
+        fs
+          .makeDirectory(storeFile(root).replace(/[\\/][^\\/]+$/, ""), { recursive: true })
+          .pipe(Effect.andThen(fs.writeFileString(storeFile(root), "{ not a store"))),
+    },
+    ({ service }) =>
+      Effect.gen(function* () {
+        const failure = yield* Effect.flip(Stream.runHead(service.subscribe(root)));
+        assert.strictEqual(failure.message, "Could not read session brief");
+      }),
+  ),
+);
+
+it.effect("concurrent removes with the log unavailable restart one fiber", () => {
+  let appends = 0;
+  const retryStarted = Deferred.makeUnsafe<void>();
+  const releaseRetry = Deferred.makeUnsafe<void>();
+  const settle = TestClock.withLive(Effect.sleep("100 millis"));
+  return harness(
+    {
+      log: seed(),
+      wrapLog: (log) => ({
+        ...log,
+        // The first retry stays in its uninterruptible write until released, so both removes
+        // take hold of the same fiber before either interrupt can finish.
+        append: (fields, meta) =>
+          Effect.suspend(() => {
+            appends += 1;
+            return appends === 2
+              ? Deferred.succeed(retryStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseRetry)),
+                  Effect.andThen(log.append(fields, meta)),
+                )
+              : log.append(fields, meta);
+          }),
+      }),
+    },
+    ({ service, fs, logFile, logIds }) =>
+      Effect.gen(function* () {
+        assert.strictEqual((yield* service.add(root, fieldsA)).log._tag, "Logged");
+        const [entry] = Option.getOrThrow(yield* Stream.runHead(service.subscribe(root))).entries;
+        // Another writer drops SB-0001, so the check re-appends; the log is then unreadable.
+        yield* fs.writeFileString(logFile, seed());
+        yield* TestClock.adjust("2 seconds");
+        yield* Deferred.await(retryStarted);
+        yield* fs.writeFileString(logFile, "{ half written");
+        const removing = yield* Effect.forkChild(
+          Effect.all(
+            [
+              Effect.flip(service.remove(root, entry!.id)),
+              Effect.flip(service.remove(root, entry!.id)),
+            ],
+            { concurrency: 2 },
+          ),
+        );
+        yield* settle;
+        yield* Deferred.succeed(releaseRetry, undefined);
+        const failures = yield* Fiber.join(removing);
+        assert.deepStrictEqual(
+          failures.map((failure) => failure.message),
+          Array(2).fill(
+            "Couldn't remove it from the annual log: log file is not valid JSON. Try again.",
+          ),
+        );
+        yield* fs.writeFileString(logFile, seed());
+        appends = 0;
+        yield* TestClock.adjust("5 seconds");
+        for (let i = 0; i < 50 && appends === 0; i++) yield* settle;
+        yield* settle;
+        yield* TestClock.adjust("2 seconds");
+        yield* settle;
+        assert.strictEqual(appends, 1);
+        assert.deepStrictEqual(yield* logIds, ["SB-0001"]);
+        const view = Option.getOrThrow(yield* Stream.runHead(service.subscribe(root)));
+        assert.deepStrictEqual(view.entries[0]?.log, { _tag: "Logged", sbId: "SB-0001" });
+      }),
+  );
+});

@@ -74,6 +74,31 @@ const briefError = (message: string) => (cause: unknown) =>
     message: `${message}: ${cause instanceof Error ? cause.message : String(cause)}`,
   });
 
+// Store failures reach clients, so they carry a fixed message; the detail goes to the server log.
+const storeError = (message: string, detail: Record<string, unknown>) => (cause: unknown) =>
+  Effect.logWarning(`${message}.`, { ...detail, cause }).pipe(
+    Effect.andThen(Effect.fail(new SessionBriefError({ message }))),
+  );
+
+// Real thread ids hold ":" and "%" (`mcp:<uuid>`, `<command>:fork`, encodeURIComponent parts),
+// which are not file names everywhere, so a plain allowlist would refuse real threads. Ids with
+// a path separator or control character are refused outright; in the rest, safe characters stay
+// as they are and every other UTF-8 byte becomes `~XX`, so no name can hold "." or ":".
+const isUnsafeChar = (char: string) =>
+  char === "/" || char === "\\" || char.charCodeAt(0) < 0x20 || char.charCodeAt(0) === 0x7f;
+const SAFE_FILE_NAME = /^[A-Za-z0-9_~-]{1,200}$/;
+const storeFileName = (rootThreadId: string): string | null => {
+  if ([...rootThreadId].some(isUnsafeChar)) return null;
+  let name = "";
+  for (const byte of new TextEncoder().encode(rootThreadId)) {
+    const char = String.fromCharCode(byte);
+    name += /[A-Za-z0-9_-]/.test(char)
+      ? char
+      : `~${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+  }
+  return SAFE_FILE_NAME.test(name) ? name : null;
+};
+
 const isUnsettled = (log: SessionBriefLogState) =>
   log._tag === "Pending" || log._tag === "Retrying";
 
@@ -100,29 +125,35 @@ export const layer = Layer.effect(
     const scope = yield* Effect.scope;
 
     const storeDir = path.join(config.stateDir, "session-briefs");
-    const storePath = (rootThreadId: ThreadId) => path.join(storeDir, `${rootThreadId}.json`);
+    const storePath = (rootThreadId: ThreadId) => {
+      const name = storeFileName(rootThreadId);
+      return name === null
+        ? Effect.fail(new SessionBriefError({ message: "invalid thread id" }))
+        : Effect.succeed(path.join(storeDir, `${name}.json`));
+    };
     const briefs = new Map<ThreadId, ReadonlyArray<StoredEntry>>();
     const changes = new Map<ThreadId, PubSub.PubSub<void>>();
     const retries = new Map<string, Fiber.Fiber<void>>();
     // One lock for every brief keeps read-modify-write of a store file from losing entries.
     const lock = yield* Semaphore.make(1);
 
-    const decodeStore = (text: string) =>
-      decodeStoreFile(text).pipe(
-        Effect.mapError(briefError("Session brief store is not readable")),
-      );
-
     const load = Effect.fn("SessionBriefService.load")(function* (rootThreadId: ThreadId) {
+      const file = yield* storePath(rootThreadId);
       const cached = briefs.get(rootThreadId);
       if (cached !== undefined) return cached;
-      const text = yield* fs.readFileString(storePath(rootThreadId)).pipe(
+      const text = yield* fs.readFileString(file).pipe(
         Effect.catchIf(
           (error) => error.reason._tag === "NotFound",
           () => Effect.succeed(null),
         ),
-        Effect.mapError(briefError("Could not read session brief")),
+        Effect.catch(storeError("Could not read session brief", { file })),
       );
-      const entries = text === null ? [] : (yield* decodeStore(text)).entries;
+      const entries =
+        text === null
+          ? []
+          : (yield* decodeStoreFile(text).pipe(
+              Effect.catch(storeError("Could not read session brief", { file })),
+            )).entries;
       briefs.set(rootThreadId, entries);
       return entries;
     });
@@ -147,13 +178,14 @@ export const layer = Layer.effect(
       const entries = next.filter(
         (entry) => !entry.cleared || isUnsettled(entry.log) || retries.has(entry.id),
       );
+      const filePath = yield* storePath(rootThreadId);
       const contents = yield* encodeStoreFile({ version: 1, rootThreadId, entries }).pipe(
-        Effect.mapError(briefError("Could not encode session brief")),
+        Effect.catch(storeError("Could not save session brief", { file: filePath })),
       );
-      yield* writeFileStringAtomically({ filePath: storePath(rootThreadId), contents }).pipe(
+      yield* writeFileStringAtomically({ filePath, contents }).pipe(
         Effect.provideService(FileSystem.FileSystem, fs),
         Effect.provideService(Path.Path, path),
-        Effect.mapError(briefError("Could not save session brief")),
+        Effect.catch(storeError("Could not save session brief", { file: filePath })),
       );
       briefs.set(rootThreadId, entries);
       yield* PubSub.publish(yield* changesFor(rootThreadId), undefined);
@@ -165,12 +197,14 @@ export const layer = Layer.effect(
       f: (entries: ReadonlyArray<StoredEntry>) => {
         readonly entries: ReadonlyArray<StoredEntry>;
         readonly result: A;
+        /** Nothing changed, so the store file is left alone. */
+        readonly unchanged?: boolean;
       },
     ) =>
       lock.withPermits(1)(
         Effect.gen(function* () {
           const next = f(yield* load(rootThreadId));
-          yield* save(rootThreadId, next.entries);
+          if (next.unchanged !== true) yield* save(rootThreadId, next.entries);
           return next.result;
         }),
       );
@@ -211,6 +245,10 @@ export const layer = Layer.effect(
       }
       return current;
     });
+
+    // Every public entry point checks the root first, so a bad id never names a file.
+    const rootOf = (threadId: ThreadId) =>
+      resolveRoot(threadId).pipe(Effect.tap((rootThreadId) => storePath(rootThreadId)));
 
     interface Drive {
       readonly rootThreadId: ThreadId;
@@ -310,7 +348,7 @@ export const layer = Layer.effect(
       callerThreadId: ThreadId,
       fields: SessionBriefFields,
     ) {
-      const rootThreadId = yield* resolveRoot(callerThreadId);
+      const rootThreadId = yield* rootOf(callerThreadId);
       const rootShell = yield* shellOf(rootThreadId);
       const meta = { sessionId: rootThreadId, sessionTitle: rootShell?.title ?? rootThreadId };
       const entry: StoredEntry = {
@@ -365,7 +403,7 @@ export const layer = Layer.effect(
     const subscribe = (threadId: ThreadId) =>
       Stream.unwrap(
         Effect.gen(function* () {
-          const rootThreadId = yield* resolveRoot(threadId);
+          const rootThreadId = yield* rootOf(threadId);
           // Subscribe before reading so a change during the first read is not missed.
           const subscription = yield* PubSub.subscribe(yield* changesFor(rootThreadId));
           return Stream.concat(
@@ -378,10 +416,11 @@ export const layer = Layer.effect(
       );
 
     const clear = Effect.fn("SessionBriefService.clear")(function* (threadId: ThreadId) {
-      const rootThreadId = yield* resolveRoot(threadId);
+      const rootThreadId = yield* rootOf(threadId);
       const cleared = yield* update(rootThreadId, (entries) => ({
         entries: entries.map((entry) => (entry.cleared ? entry : { ...entry, cleared: true })),
         result: visibleCount(entries),
+        unchanged: visibleCount(entries) === 0,
       }));
       return { cleared };
     });
@@ -399,7 +438,7 @@ export const layer = Layer.effect(
       threadId: ThreadId,
       entryId: string,
     ) {
-      const rootThreadId = yield* resolveRoot(threadId);
+      const rootThreadId = yield* rootOf(threadId);
       if ((yield* findEntry(rootThreadId, entryId)) === undefined) return { removedSbId: null };
       const fiber = retries.get(entryId);
       if (fiber !== undefined) yield* Fiber.interrupt(fiber);
@@ -416,15 +455,23 @@ export const layer = Layer.effect(
       if (sbId !== null) {
         const removal = yield* log.remove(sbId, entry);
         if (removal._tag === "Unavailable") {
+          // Decided under the lock: a concurrent remove of the same entry may already have
+          // restarted its fiber, or dropped the entry.
           if (fiber !== undefined) {
-            yield* startDriving({
-              rootThreadId,
-              entryId,
-              fields: entry,
-              meta: titleMeta(rootThreadId),
-              state: entry.log,
-              ownSbId: entry.ownSbId,
-            });
+            yield* lock.withPermits(1)(
+              Effect.gen(function* () {
+                const current = (yield* load(rootThreadId)).find((item) => item.id === entryId);
+                if (current === undefined || retries.has(entryId)) return;
+                yield* startDriving({
+                  rootThreadId,
+                  entryId,
+                  fields: current,
+                  meta: titleMeta(rootThreadId),
+                  state: current.log,
+                  ownSbId: current.ownSbId,
+                });
+              }),
+            );
           }
           return yield* new SessionBriefError({
             message: `Couldn't remove it from the annual log: ${removal.reason}. Try again.`,
@@ -435,6 +482,7 @@ export const layer = Layer.effect(
       yield* update(rootThreadId, (entries) => ({
         entries: entries.filter((item) => item.id !== entryId),
         result: undefined,
+        unchanged: !entries.some((item) => item.id === entryId),
       }));
       return { removedSbId };
     });
@@ -445,7 +493,7 @@ export const layer = Layer.effect(
         if (!name.endsWith(".json")) continue;
         const store = yield* fs
           .readFileString(path.join(storeDir, name))
-          .pipe(Effect.flatMap(decodeStore), Effect.option);
+          .pipe(Effect.flatMap(decodeStoreFile), Effect.option);
         if (store._tag === "None") {
           yield* Effect.logWarning("Skipping unreadable session brief store.", { file: name });
           continue;

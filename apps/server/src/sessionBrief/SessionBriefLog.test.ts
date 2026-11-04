@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it } from "@effect/vitest";
+import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -101,8 +101,7 @@ it.effect("Retrying when the write fails", () =>
       Effect.gen(function* () {
         const before = yield* fs.readFileString(file);
         const state = yield* service.append(fieldsA, meta);
-        assert.strictEqual(state._tag, "Retrying");
-        assert.isTrue(state._tag === "Retrying" && state.reason.length > 0);
+        assert.deepStrictEqual(state, { _tag: "Retrying", reason: "file locked", attempts: 1 });
         assert.strictEqual(yield* fs.readFileString(file), before);
       }),
     undefined,
@@ -214,3 +213,74 @@ it.effect("remove takes the entry back out", () =>
     }),
   ),
 );
+
+it.effect("Retrying reason for a busy log is short and has no path", () =>
+  withLog(
+    seed(),
+    ({ service }) =>
+      Effect.gen(function* () {
+        const state = yield* service.append(fieldsA, meta);
+        assert.deepStrictEqual(state, { _tag: "Retrying", reason: "file locked", attempts: 1 });
+      }),
+    undefined,
+    {
+      wrapFs: (fs) => ({
+        ...fs,
+        readFileString: (path) =>
+          Effect.fail(
+            PlatformError.systemError({
+              _tag: "Busy",
+              module: "FileSystem",
+              method: "readFile",
+              pathOrDescriptor: path,
+            }),
+          ),
+      }),
+    },
+  ),
+);
+
+describe("shortReason", () => {
+  const systemError = (tag: PlatformError.SystemErrorTag, code?: string) =>
+    PlatformError.systemError({
+      _tag: tag,
+      module: "FileSystem",
+      method: "readFile",
+      pathOrDescriptor: "C:\\Users\\someone\\OneDrive\\Session-Briefs-Log.json",
+      ...(code === undefined ? {} : { cause: Object.assign(new Error(code), { code }) }),
+    });
+
+  it("maps platform errors to short words", () => {
+    assert.strictEqual(SessionBriefLog.shortReason(systemError("Busy")), "file locked");
+    assert.strictEqual(SessionBriefLog.shortReason(systemError("PermissionDenied")), "file locked");
+    assert.strictEqual(SessionBriefLog.shortReason(systemError("Unknown", "EBUSY")), "file locked");
+    assert.strictEqual(SessionBriefLog.shortReason(systemError("Unknown", "EPERM")), "file locked");
+    assert.strictEqual(
+      SessionBriefLog.shortReason(systemError("Unknown", "EACCES")),
+      "file locked",
+    );
+    assert.strictEqual(SessionBriefLog.shortReason(systemError("NotFound")), "log file not found");
+    assert.strictEqual(SessionBriefLog.shortReason(systemError("TimedOut")), "log write failed");
+  });
+
+  it("keeps the log's own reasons and hides anything else", () => {
+    assert.strictEqual(
+      SessionBriefLog.shortReason(new Error("log file is not valid JSON")),
+      "log file is not valid JSON",
+    );
+    assert.strictEqual(
+      SessionBriefLog.shortReason(new Error("EBUSY: resource busy, open 'C:\\x\\log.json'")),
+      "file locked",
+    );
+    assert.strictEqual(
+      SessionBriefLog.shortReason(new Error("Failed at C:\\Users\\someone\\log.json")),
+      "log write failed",
+    );
+    assert.strictEqual(
+      SessionBriefLog.shortReason(
+        new ServerSettingsError({ settingsPath: "settings.json", operation: "read-file" }),
+      ),
+      "log write failed",
+    );
+  });
+});

@@ -86,6 +86,29 @@ describe("briefLog", () => {
     assert.deepStrictEqual(result.outcome, { _tag: "Logged", sbId: "SB-0001" });
   });
 
+  it("impossible date becomes today", () => {
+    for (const date of ["00/00", "02/31", "13/01", "04/31", "00/15"]) {
+      const result = appendToVaultLog(
+        parseVaultLog(JSON.stringify(sample([]))),
+        { ...fields, date },
+        meta,
+      );
+      assert.strictEqual(result.log.entries[0]!.date, "2026-11-04", date);
+    }
+    const leapless = appendToVaultLog(
+      parseVaultLog(JSON.stringify(sample([]))),
+      { ...fields, date: "02/29" },
+      meta,
+    );
+    assert.strictEqual(leapless.log.entries[0]!.date, "2026-11-04");
+    const valid = appendToVaultLog(
+      parseVaultLog(JSON.stringify(sample([]))),
+      { ...fields, date: "2/28" },
+      meta,
+    );
+    assert.strictEqual(valid.log.entries[0]!.date, "2026-02-28");
+  });
+
   it("remove only by matching sbId", () => {
     const log = parseVaultLog(
       JSON.stringify(

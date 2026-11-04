@@ -17,14 +17,28 @@ function localStamp(now: Date): string {
   );
 }
 
-/** "MM/DD" to "YYYY-MM-DD" in the current year; a date later than today is a typo, so today wins. */
+const daysInMonth = (year: number, month: number) => {
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  return [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!;
+};
+
+/**
+ * "MM/DD" to "YYYY-MM-DD" in the current year. A date later than today, or one that does not
+ * exist in this year (00/00, 02/31), is a typo, so today wins.
+ */
 function isoDate(md: string, now: Date): string {
-  const today = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  const year = now.getFullYear();
+  const today = `${year}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
   const match = /^(\d{1,2})\/(\d{1,2})$/.exec(md.trim());
   if (match === null) {
     return today;
   }
-  const date = `${now.getFullYear()}-${pad(Number(match[1]))}-${pad(Number(match[2]))}`;
+  const month = Number(match[1]);
+  const day = Number(match[2]);
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)) {
+    return today;
+  }
+  const date = `${year}-${pad(month)}-${pad(day)}`;
 
   return date > today ? today : date;
 }
