@@ -55,8 +55,12 @@ export function serializeVaultLog(log: VaultLog, now: Date): string {
   return JSON.stringify(log, null, 2) + "\n";
 }
 
-const sameBrief = (entry: Record<string, unknown>, fields: SessionBriefFields) =>
-  entry.topic === fields.topic && entry.changed === fields.changed;
+// Entries come from a file another writer owns; tolerate and preserve anything that is not an object.
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const sameBrief = (entry: unknown, fields: SessionBriefFields) =>
+  isRecord(entry) && entry.topic === fields.topic && entry.changed === fields.changed;
 
 export function appendToVaultLog(
   log: VaultLog,
@@ -64,11 +68,11 @@ export function appendToVaultLog(
   meta: { sessionId: string; sessionTitle: string; now: Date },
 ): { log: VaultLog; outcome: { _tag: "Logged" | "AlreadyLogged"; sbId: string } } {
   const existing = log.entries.find((entry) => sameBrief(entry, fields));
-  if (existing !== undefined) {
+  if (isRecord(existing)) {
     return { log, outcome: { _tag: "AlreadyLogged", sbId: String(existing.id) } };
   }
   const last = log.entries.reduce((max, entry) => {
-    const match = /^SB-(\d+)$/.exec(String(entry.id));
+    const match = isRecord(entry) ? /^SB-(\d+)$/.exec(String(entry.id)) : null;
     return match === null ? max : Math.max(max, Number(match[1]));
   }, 0);
   const sbId = `SB-${String(last + 1).padStart(4, "0")}`;
@@ -95,7 +99,9 @@ export function removeFromVaultLog(
   sbId: string,
   fields: SessionBriefFields,
 ): { log: VaultLog; removed: boolean } {
-  const index = log.entries.findIndex((entry) => entry.id === sbId && sameBrief(entry, fields));
+  const index = log.entries.findIndex(
+    (entry) => isRecord(entry) && entry.id === sbId && sameBrief(entry, fields),
+  );
   if (index === -1) {
     return { log, removed: false };
   }
@@ -110,6 +116,10 @@ export function vaultLogHas(
   sessionId: string,
 ): boolean {
   return log.entries.some(
-    (entry) => entry.id === sbId && sameBrief(entry, fields) && entry.session_id === sessionId,
+    (entry) =>
+      isRecord(entry) &&
+      entry.id === sbId &&
+      sameBrief(entry, fields) &&
+      entry.session_id === sessionId,
   );
 }

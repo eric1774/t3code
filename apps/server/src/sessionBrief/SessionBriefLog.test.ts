@@ -4,7 +4,9 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 
+import { ServerSettingsError } from "@t3tools/contracts";
 import { ServerSettingsService } from "../serverSettings.ts";
 import { parseVaultLog } from "./briefLog.ts";
 import * as SessionBriefLog from "./SessionBriefLog.ts";
@@ -23,6 +25,10 @@ const withLog = <A, E, R>(
     readonly fs: FileSystem.FileSystem;
   }) => Effect.Effect<A, E, R>,
   pathSetting?: (file: string) => string,
+  options: {
+    readonly wrapFs?: (fs: FileSystem.FileSystem) => FileSystem.FileSystem;
+    readonly settings?: Layer.Layer<ServerSettingsService, ServerSettingsError>;
+  } = {},
 ) =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -34,9 +40,13 @@ const withLog = <A, E, R>(
       Effect.provide(
         SessionBriefLog.layer.pipe(
           Layer.provide(
-            ServerSettingsService.layerTest({
-              sessionBriefLogPath: pathSetting ? pathSetting(file) : file,
-            }),
+            options.settings ??
+              ServerSettingsService.layerTest({
+                sessionBriefLogPath: pathSetting ? pathSetting(file) : file,
+              }),
+          ),
+          Layer.provide(
+            Layer.succeed(FileSystem.FileSystem, options.wrapFs ? options.wrapFs(fs) : fs),
           ),
         ),
       ),
@@ -85,15 +95,75 @@ it.effect("Retrying when file is invalid JSON, and file is untouched", () =>
 );
 
 it.effect("Retrying when the write fails", () =>
-  withLog(seed(), ({ service, file, fs }) =>
-    Effect.gen(function* () {
-      yield* fs.chmod(file, 0o444);
-      const before = yield* fs.readFileString(file);
-      const state = yield* service.append(fieldsA, meta);
-      assert.strictEqual(state._tag, "Retrying");
-      assert.isTrue(state._tag === "Retrying" && state.reason.length > 0);
-      assert.strictEqual(yield* fs.readFileString(file), before);
-    }),
+  withLog(
+    seed(),
+    ({ service, file, fs }) =>
+      Effect.gen(function* () {
+        const before = yield* fs.readFileString(file);
+        const state = yield* service.append(fieldsA, meta);
+        assert.strictEqual(state._tag, "Retrying");
+        assert.isTrue(state._tag === "Retrying" && state.reason.length > 0);
+        assert.strictEqual(yield* fs.readFileString(file), before);
+      }),
+    undefined,
+    {
+      wrapFs: (fs) => ({
+        ...fs,
+        writeFileString: () =>
+          Effect.fail(
+            PlatformError.systemError({
+              _tag: "PermissionDenied",
+              module: "FileSystem",
+              method: "writeFileString",
+              description: "disk is read-only",
+            }),
+          ),
+      }),
+    },
+  ),
+);
+
+it.effect("Retrying when settings cannot be read", () =>
+  withLog(
+    seed(),
+    ({ service, file, fs }) =>
+      Effect.gen(function* () {
+        const before = yield* fs.readFileString(file);
+        const state = yield* service.append(fieldsA, meta);
+        assert.strictEqual(state._tag, "Retrying");
+        assert.isTrue(state._tag === "Retrying" && state.reason.length > 0);
+        assert.strictEqual(yield* fs.readFileString(file), before);
+      }),
+    undefined,
+    {
+      settings: Layer.effect(
+        ServerSettingsService,
+        Effect.gen(function* () {
+          const real = yield* ServerSettingsService;
+          return ServerSettingsService.of({
+            ...real,
+            getSettings: Effect.fail(
+              new ServerSettingsError({ settingsPath: "settings.json", operation: "read-file" }),
+            ),
+          });
+        }).pipe(Effect.provide(ServerSettingsService.layerTest())),
+      ),
+    },
+  ),
+);
+
+it.effect("append tolerates non-object entries and preserves them", () =>
+  withLog(
+    JSON.stringify({ entries: [null, 5, { id: "SB-0007", topic: "x", changed: "y" }] }),
+    ({ service, file, fs }) =>
+      Effect.gen(function* () {
+        const state = yield* service.append(fieldsA, meta);
+        assert.deepStrictEqual(state, { _tag: "Logged", sbId: "SB-0008" });
+        const entries = parseVaultLog(yield* fs.readFileString(file)).entries;
+        assert.strictEqual(entries.length, 4);
+        assert.strictEqual(entries[0], null as never);
+        assert.strictEqual(entries[1], 5 as never);
+      }),
   ),
 );
 

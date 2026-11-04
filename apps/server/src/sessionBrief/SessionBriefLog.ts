@@ -54,7 +54,7 @@ export const layer = Layer.effect(
 
     const logPath = settings.getSettings.pipe(
       Effect.map((value) => value.sessionBriefLogPath.trim()),
-      Effect.orElseSucceed(() => ""),
+      Effect.mapError((error) => new LogUnavailable({ reason: shortReason(error) })),
     );
     const now = Effect.map(DateTime.now, DateTime.toDateUtc);
 
@@ -86,32 +86,38 @@ export const layer = Layer.effect(
       fields: SessionBriefFields,
       meta: { readonly sessionId: string; readonly sessionTitle: string },
     ) {
-      const filePath = yield* logPath;
-      if (filePath === "") {
-        return { _tag: "NotLogged", reason: "no log path set in Settings" } as SessionBriefLogState;
-      }
-      return yield* lock
-        .withPermits(1)(
+      return yield* Effect.gen(function* () {
+        const filePath = yield* logPath;
+        if (filePath === "") {
+          return {
+            _tag: "NotLogged",
+            reason: "no log path set in Settings",
+          } as SessionBriefLogState;
+        }
+        return yield* lock.withPermits(1)(
           Effect.gen(function* () {
             const log = yield* readLog(filePath);
             const at = yield* now;
-            const result = appendToVaultLog(log, fields, { ...meta, now: at });
+            const result = yield* Effect.try({
+              try: () => appendToVaultLog(log, fields, { ...meta, now: at }),
+              catch: (error) => new LogUnavailable({ reason: shortReason(error) }),
+            });
             if (result.outcome._tag === "Logged") {
               yield* writeLog(filePath, result.log, at);
             }
             return result.outcome as SessionBriefLogState;
           }),
-        )
-        .pipe(
-          Effect.catchTags({
-            LogUnavailable: (error) =>
-              Effect.succeed({
-                _tag: "Retrying",
-                reason: error.reason,
-                attempts: 1,
-              } as SessionBriefLogState),
-          }),
         );
+      }).pipe(
+        Effect.catchTags({
+          LogUnavailable: (error) =>
+            Effect.succeed({
+              _tag: "Retrying",
+              reason: error.reason,
+              attempts: 1,
+            } as SessionBriefLogState),
+        }),
+      );
     });
 
     const verify = Effect.fn("SessionBriefLog.verify")(function* (
@@ -119,32 +125,30 @@ export const layer = Layer.effect(
       fields: SessionBriefFields,
       sessionId: string,
     ) {
-      const filePath = yield* logPath;
-      if (filePath === "") return false;
-      return yield* lock
-        .withPermits(1)(readLog(filePath))
-        .pipe(
-          Effect.map((log) => vaultLogHas(log, sbId, fields, sessionId)),
-          Effect.orElseSucceed(() => false),
-        );
+      return yield* Effect.gen(function* () {
+        const filePath = yield* logPath;
+        if (filePath === "") return false;
+        const log = yield* lock.withPermits(1)(readLog(filePath));
+        return vaultLogHas(log, sbId, fields, sessionId);
+      }).pipe(Effect.orElseSucceed(() => false));
     });
 
     const remove = Effect.fn("SessionBriefLog.remove")(function* (
       sbId: string,
       fields: SessionBriefFields,
     ) {
-      const filePath = yield* logPath;
-      if (filePath === "") return false;
-      return yield* lock
-        .withPermits(1)(
+      return yield* Effect.gen(function* () {
+        const filePath = yield* logPath;
+        if (filePath === "") return false;
+        return yield* lock.withPermits(1)(
           Effect.gen(function* () {
             const result = removeFromVaultLog(yield* readLog(filePath), sbId, fields);
             if (!result.removed) return false;
             yield* writeLog(filePath, result.log, yield* now);
             return true;
           }),
-        )
-        .pipe(Effect.orElseSucceed(() => false));
+        );
+      }).pipe(Effect.orElseSucceed(() => false));
     });
 
     return SessionBriefLog.of({ append, verify, remove });
