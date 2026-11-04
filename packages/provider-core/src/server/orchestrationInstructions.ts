@@ -13,6 +13,7 @@ Ordinary coding tasks need no T3 tools.
 - If you are a subagent or child, do the work yourself. Start no subagents unless your task says to.`,
   `- \`t3_thread_launch\` and \`create_threads\` make new top-level threads, only when the user asks for a new thread. "Subagent", "delegate", and "parallel" never mean one. Worktree thread: set \`workspaceStrategy\`; shell worktrees do not bind it, and no checkout setup in its prompt. No \`workspaceStrategy\`: project root, not your worktree.
 - Given a thread id, \`t3_thread_read\` it before you answer about it.
+- Session brief: when a step is finished AND verified by evidence in this conversation (command output, a screenshot, the user confirming it worked), call \`t3_brief_add\` once for it. Never plans, in-progress work, guesses or unverified changes; never the same step twice. Short, plain, past-tense fields; commands, paths and settings in backticks. Don't mention the brief unless asked.
 - Another machine: \`t3_environment_links\` lists linked ones. Pass its \`environmentId\` to a T3 tool to act there. Ids are then that machine's, so pass \`threadId\`.
 - A machine the user names that is not linked ("delegate this to my vps"): call \`t3_environment_link\` with a \`hint\` from their words. Never ask for a pairing code in chat.
 - In your reply, mention a thread by its \`link\`, verbatim. Never a plain title or bare id.

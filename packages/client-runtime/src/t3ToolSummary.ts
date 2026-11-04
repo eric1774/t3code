@@ -324,6 +324,9 @@ export function summarizeT3ToolCalls(
     case "worktree-list":
       label = phrase("Listed", "list", `workspace branches ${times}`);
       break;
+    case "brief-add":
+      label = phrase("Added", "add", `to the session brief ${times}`);
+      break;
     case "worktree-status":
       label = phrase("Checked", "check", `worktree status ${times}`);
       break;
