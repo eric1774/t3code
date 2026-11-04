@@ -1563,9 +1563,6 @@ export function createServerEnvironmentAtoms<R, E>(
       scheduler: configScheduler,
       concurrency: configConcurrency,
     }),
-    // Deliberately not on the config lane: run-now blocks until the run is
-    // dispatched, and a slow run must not stall settings/keybinding/provider
-    // mutations (or other scheduled-task edits) queued behind it.
     clearSessionBrief: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:session-brief:clear",
       tag: WS_METHODS.sessionBriefClear,
@@ -1574,6 +1571,9 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:session-brief:remove",
       tag: WS_METHODS.sessionBriefRemove,
     }),
+    // Deliberately not on the config lane: run-now blocks until the run is
+    // dispatched, and a slow run must not stall settings/keybinding/provider
+    // mutations (or other scheduled-task edits) queued behind it.
     runScheduledTaskNow: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:scheduled-task:run-now",
       tag: WS_METHODS.scheduledTasksRunNow,

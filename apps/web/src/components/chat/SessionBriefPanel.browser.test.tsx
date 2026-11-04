@@ -3,6 +3,9 @@ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { AsyncResult } from "effect/reactivity";
 import { expect, it, vi } from "vite-plus/test";
 
+// Layout assertions below need the real Tailwind classes.
+import "~/index.css";
+
 const state = vi.hoisted(() => ({
   entries: [] as ReadonlyArray<unknown>,
   confirm: vi.fn(),
@@ -85,13 +88,45 @@ it("renders numbered entries and badges", async () => {
     "1.1 What changed: Changed 1.",
     "5.3 Rollback: Undo it.",
     "SB-0177",
-    "SB-0123 · already logged",
+    "already logged as SB-0123",
     "logging…",
     "retrying: vault locked",
     "not logged: no vault",
   ]) {
     expect(text).toContain(expected);
   }
+});
+
+it("says 1 entry for a single entry", async () => {
+  setup([entry(1, { _tag: "Pending" })]);
+  await using screen = await render(<SessionBriefPanel threadRef={threadRef} />, {
+    router: false, // no navigation in the panel
+  });
+  await expect.element(screen.getByText("1 entry", { exact: true })).toBeVisible();
+});
+
+it("a long retrying reason keeps the Remove button visible", async () => {
+  const reason =
+    `Busy: FileSystem.readFile (C:/Users/someone/OneDrive - Org/${"x".repeat(150)}/Session-Briefs-Log.json)`.slice(
+      0,
+      200,
+    );
+  expect(reason).toHaveLength(200);
+  setup([entry(1, { _tag: "Retrying", reason, attempts: 2 })]);
+  await using screen = await render(
+    <div style={{ width: "360px" }}>
+      <SessionBriefPanel threadRef={threadRef} />
+    </div>,
+    { router: false }, // no navigation in the panel
+  );
+  const removeButton = screen.getByRole("button", { name: "Remove Topic 1" });
+  await expect.element(removeButton).toBeInTheDocument();
+  await expect.element(removeButton).toBeVisible();
+  await expect.element(screen.getByText("1. Topic 1 (10/23)")).toBeVisible();
+  const panel = screen.container.querySelector("[data-session-brief-panel]")!;
+  const button = removeButton.element().getBoundingClientRect();
+  expect(button.width).toBeGreaterThan(0);
+  expect(button.right).toBeLessThanOrEqual(panel.getBoundingClientRect().right + 0.5);
 });
 
 it("shows the empty state", async () => {

@@ -30,14 +30,21 @@ function LogBadge({ log }: { readonly log: SessionBriefEntry["log"] }) {
     case "Logged":
       return <Badge variant="success">{log.sbId}</Badge>;
     case "AlreadyLogged":
-      return <Badge variant="success">{`${log.sbId} · already logged`}</Badge>;
+      return <Badge variant="success">{`already logged as ${log.sbId}`}</Badge>;
     case "Pending":
       return <Badge variant="warning">logging…</Badge>;
     case "Retrying":
       return (
         <Tooltip>
-          <TooltipTrigger render={<Badge variant="warning">{`retrying: ${log.reason}`}</Badge>} />
-          <TooltipPopup>{`Attempt ${log.attempts}`}</TooltipPopup>
+          {/* Capped so a long reason never squeezes the title or the Remove button. */}
+          <TooltipTrigger
+            render={
+              <Badge variant="warning" className="max-w-[12rem]">
+                <span className="truncate">{`retrying: ${log.reason}`}</span>
+              </Badge>
+            }
+          />
+          <TooltipPopup>{`${log.reason} (attempt ${log.attempts})`}</TooltipPopup>
         </Tooltip>
       );
     case "NotLogged":
@@ -129,7 +136,9 @@ export function SessionBriefPanel(props: { readonly threadRef: ScopedThreadRef }
   return (
     <div className="flex h-full min-h-0 flex-col" data-session-brief-panel>
       <div className="flex shrink-0 items-center gap-2 border-b px-3 py-2">
-        <span className="mr-auto text-xs text-muted-foreground">{`${entries.length} entries`}</span>
+        <span className="mr-auto text-xs text-muted-foreground">
+          {`${entries.length} ${entries.length === 1 ? "entry" : "entries"}`}
+        </span>
         <Button
           size="compact"
           disabled={entries.length === 0}
