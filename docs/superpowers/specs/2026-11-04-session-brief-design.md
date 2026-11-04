@@ -13,7 +13,7 @@ He has this today in Claude Code as a custom mod (`~/.claude/mods/session-brief`
 The Claude Code mod, `C:\Users\eolson\.claude\mods\session-brief\hooks\register.tsx`, is the reference implementation. Read it. In short:
 
 - **Entry fields:** `topic`, `date` (`MM/DD`), `changed`, `verified`, optional `rollback`, optional `note`.
-- **Agent rule:** while the brief is on, a system-prompt rule tells the agent to call an add tool once per step that is *completed AND verified by evidence in this conversation*. That means command output, a screenshot, or the user confirming it worked. Never plans, guesses, or unverified changes; one entry per step; no duplicates. See "Agent instructions" below for the wording.
+- **Agent rule:** while the brief is on, a system-prompt rule tells the agent to call an add tool once per step that is _completed AND verified by evidence in this conversation_. That means command output, a screenshot, or the user confirming it worked. Never plans, guesses, or unverified changes; one entry per step; no duplicates. See "Agent instructions" below for the wording.
 - **Pane:** per session. Entries are numbered in insertion order: `1. Topic (MM/DD)`, then `1.1 What changed: …`, `1.2 Verified: …`, `1.3 Rollback: …`, `1.4 Note: …`. Only the fields that are present get a line.
 - **Copy:** plain text, never Markdown. The numbers are literal digits, so ticket systems keep them. Sub-lines are indented 4 spaces, lines end in CRLF, a blank line separates steps, and every backtick is removed. `asText()` in the mod is the exact format.
 - **Clear:** asks first, then empties this session's brief. It never touches the log.
@@ -39,6 +39,7 @@ The Claude Code mod, `C:\Users\eolson\.claude\mods\session-brief\hooks\register.
    - **Not logged:** only when no log path is configured on this server. No retries happen in this state.
 
    **Failed writes retry automatically until they succeed** (Eric's answer). This includes after a server restart, so the log state is stored with each entry. The badge always shows whether the entry is still failing or has landed.
+
 5. **Copy and Clear** behave exactly like the mod, with the same text format and confirm-before-clear. After a clear, numbering in the brief restarts at 1. SB numbers never restart.
 6. **Remove one entry.** Each entry has a remove control that takes it out of the brief **and** out of the JSON log. Eric asked for this.
    - Each brief entry stores the SB id it wrote, and Remove deletes the log record **by that SB id only**. It does not match on topic or changed text the way the mod's `removeFromLog` does.
