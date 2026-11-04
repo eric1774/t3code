@@ -5,6 +5,7 @@
 **Goal:** Give each T3 thread a "session brief" of verified work. Any agent adds entries through an MCP tool, Eric sees them live in a right-panel **Brief** tab with Copy, Clear, and Remove, and every entry is appended to the shared vault JSON log with the next SB number.
 
 **Architecture:**
+
 - A new server module `apps/server/src/sessionBrief/` holds three things: a per-root-thread JSON store in T3's state directory, a single-writer log service that appends to the external vault file and keeps retrying, and the change feed.
 - A new MCP toolkit exposes `t3_brief_add`. New WS RPCs stream a thread's brief and run clear and remove.
 - The web app gets a new `"brief"` right-panel kind rendered by a new `SessionBriefPanel`.
@@ -44,17 +45,18 @@
 
 ## Review Focus
 
-1. **The log file is locked for minutes** (OneDrive syncing, Obsidian holding it open). The entry shows `Retrying` with the reason, keeps retrying, lands exactly once, and later entries still get unique SB ids. *Test in Task 3.*
-2. **The log file is mid-sync or briefly invalid JSON.** T3 never overwrites it. The entry goes to `Retrying` with the reason "log file is not valid JSON". *Test in Task 3.*
-3. **The log path is set but the file doesn't exist** (typo, or OneDrive not mounted). T3 does **not** create a new file, which would silently split the history. It retries with the reason "log file not found". *Test in Task 3.*
-4. **The server restarts while entries are still `Pending` or `Retrying`, including entries hidden by Clear.** They resume on startup and land. *Test in Task 4.*
-5. **Two threads, or a parent and its subagent, add entries at the same moment.** Writes are serialized, SB ids never repeat, and both entries land. *Test in Task 3.*
+1. **The log file is locked for minutes** (OneDrive syncing, Obsidian holding it open). The entry shows `Retrying` with the reason, keeps retrying, lands exactly once, and later entries still get unique SB ids. _Test in Task 3._
+2. **The log file is mid-sync or briefly invalid JSON.** T3 never overwrites it. The entry goes to `Retrying` with the reason "log file is not valid JSON". _Test in Task 3._
+3. **The log path is set but the file doesn't exist** (typo, or OneDrive not mounted). T3 does **not** create a new file, which would silently split the history. It retries with the reason "log file not found". _Test in Task 3._
+4. **The server restarts while entries are still `Pending` or `Retrying`, including entries hidden by Clear.** They resume on startup and land. _Test in Task 4._
+5. **Two threads, or a parent and its subagent, add entries at the same moment.** Writes are serialized, SB ids never repeat, and both entries land. _Test in Task 3._
 
 ---
 
 ### Task 1: Contracts and server setting
 
 **Files:**
+
 - Create: `packages/contracts/src/sessionBrief.ts`
 - Modify:
   - `packages/contracts/src/index.ts`: one export line next to `threadMetadataMcp.ts` (line 46).
@@ -64,6 +66,7 @@
 - Test: `packages/contracts/src/sessionBrief.test.ts`
 
 **Interfaces:**
+
 - Produces, all exported from `@t3tools/contracts`:
   - `SessionBriefFields = Schema.Struct({ topic, date, changed, verified, rollback: optional, note: optional })`:
     - `topic` is `TrimmedNonEmptyString`, max 200.
@@ -101,10 +104,12 @@
 ### Task 2: Copy-text formatter
 
 **Files:**
+
 - Create: `packages/shared/src/sessionBriefText.ts`, exported as `@t3tools/shared/sessionBriefText`. Add it to the package `exports` the same way `atomicWrite` is.
 - Test: `packages/shared/src/sessionBriefText.test.ts`
 
 **Interfaces:**
+
 - Consumes: `SessionBriefFields` (Task 1).
 - Produces: `formatSessionBriefText(entries: ReadonlyArray<SessionBriefFields>, eol?: string): string`. The default `eol` is `"\r\n"`, and numbering starts at 1 in array order.
 
@@ -112,16 +117,28 @@
 
 ```ts
 const entries = [
-  { topic: "Synology PW-FILES DC list", date: "10/23", changed: "Added `CH-BLT-DC01`.", verified: "DSM test passed." },
-  { topic: "CA backup", date: "10/23", changed: "Ran `Backup-CARoleService`.", verified: "Hashes match.", note: "FS2 copy kept." },
+  {
+    topic: "Synology PW-FILES DC list",
+    date: "10/23",
+    changed: "Added `CH-BLT-DC01`.",
+    verified: "DSM test passed.",
+  },
+  {
+    topic: "CA backup",
+    date: "10/23",
+    changed: "Ran `Backup-CARoleService`.",
+    verified: "Hashes match.",
+    note: "FS2 copy kept.",
+  },
 ];
 expect(formatSessionBriefText(entries)).toBe(
   "1. Synology PW-FILES DC list (10/23)\r\n    1.1 What changed: Added CH-BLT-DC01.\r\n    1.2 Verified: DSM test passed.\r\n\r\n" +
-  "2. CA backup (10/23)\r\n    2.1 What changed: Ran Backup-CARoleService.\r\n    2.2 Verified: Hashes match.\r\n    2.3 Note: FS2 copy kept.",
+    "2. CA backup (10/23)\r\n    2.1 What changed: Ran Backup-CARoleService.\r\n    2.2 Verified: Hashes match.\r\n    2.3 Note: FS2 copy kept.",
 );
 ```
 
-  Also add `returns empty string for no entries` and `uses the given eol` (`"\n"`).
+Also add `returns empty string for no entries` and `uses the given eol` (`"\n"`).
+
 - [ ] **Step 2:** Run it. Expected: FAIL.
 - [ ] **Step 3:** Implement it. Port `toSteps` and `asText` from the mod, using the field order and labels from Global Constraints.
 - [ ] **Step 4:** Run it. Expected: PASS.
@@ -130,6 +147,7 @@ expect(formatSessionBriefText(entries)).toBe(
 ### Task 3: Vault log writer (pure log edits plus the writer service)
 
 **Files:**
+
 - Create:
   - `apps/server/src/sessionBrief/briefLog.ts`: pure functions, no I/O.
   - `apps/server/src/sessionBrief/SessionBriefLog.ts`: the service.
@@ -138,6 +156,7 @@ expect(formatSessionBriefText(entries)).toBe(
   - `apps/server/src/sessionBrief/SessionBriefLog.test.ts`
 
 **Interfaces:**
+
 - Consumes: `SessionBriefFields` and `SessionBriefLogState` (Task 1), `ServerSettingsService` (`apps/server/src/serverSettings.ts:252`), and `writeFileStringAtomically` (`@t3tools/shared/atomicWrite`).
 - Produces, in `briefLog.ts`:
   - `type VaultLog = Record<string, unknown> & { entries: Array<Record<string, unknown>> }`.
@@ -180,10 +199,12 @@ expect(formatSessionBriefText(entries)).toBe(
 ### Task 4: Brief store, retry loop and change feed
 
 **Files:**
+
 - Create: `apps/server/src/sessionBrief/SessionBriefService.ts`
 - Test: `apps/server/src/sessionBrief/SessionBriefService.test.ts`
 
 **Interfaces:**
+
 - Consumes:
   - `SessionBriefLog` (Task 3) and `ServerConfig.stateDir` (`apps/server/src/config.ts:38`).
   - `ThreadManagementService.getThreadShell` (`orchestration-v2/ThreadManagementService.ts:422`), for `lineage` and title.
@@ -221,6 +242,7 @@ expect(formatSessionBriefText(entries)).toBe(
 ### Task 5: MCP tool `t3_brief_add` and agent instructions
 
 **Files:**
+
 - Create:
   - `apps/server/src/mcp/toolkits/sessionBrief/tools.ts`
   - `apps/server/src/mcp/toolkits/sessionBrief/handlers.ts`
@@ -234,6 +256,7 @@ expect(formatSessionBriefText(entries)).toBe(
 - Test: `apps/server/src/mcp/toolkits/sessionBrief/sessionBrief.test.ts`, following `toolkits/core.test.ts:507-580`.
 
 **Interfaces:**
+
 - Consumes: `SessionBriefService.add` (Task 4), `SessionBriefAddInput`/`Result` (Task 1), and `McpToolAccess.actsAsCaller`.
 - Produces the tool `t3_brief_add`:
   - Parameters are `SessionBriefAddInput`. There is **no** `threadId` or `environmentId`.
@@ -262,6 +285,7 @@ expect(formatSessionBriefText(entries)).toBe(
 ### Task 6: WS handlers and client-runtime atoms
 
 **Files:**
+
 - Modify:
   - `apps/server/src/ws.ts`: yield `SessionBriefService` near line 1398, and add three handlers in `ServerWsRpcGroup.of` (from line 1998), following the scheduled-task handlers at 2276-2286.
   - `packages/client-runtime/src/rpc/client.ts`: add `sessionBriefSubscribe` to `EnvironmentSubscriptionRpcTag` (line 61).
@@ -269,6 +293,7 @@ expect(formatSessionBriefText(entries)).toBe(
 - Test: extend `SessionBriefService.test.ts` only if a handler adds logic. Otherwise typecheck is the gate.
 
 **Interfaces:**
+
 - Produces, for the web app:
   - `serverEnvironment.sessionBriefLive({ environmentId, input: { threadId } })` gives an atom of `SessionBriefView`.
   - `serverEnvironment.clearSessionBrief` and `serverEnvironment.removeSessionBriefEntry` are commands taking `{ environmentId, input }`.
@@ -280,6 +305,7 @@ expect(formatSessionBriefText(entries)).toBe(
 ### Task 7: Brief tab in the right panel
 
 **Files:**
+
 - Create:
   - `apps/web/src/components/chat/SessionBriefPanel.tsx`: the panel.
   - `apps/web/src/components/chat/SessionBriefTabTitle.tsx`: the live count label.
@@ -298,10 +324,12 @@ expect(formatSessionBriefText(entries)).toBe(
 - Test: `apps/web/src/components/chat/SessionBriefPanel.browser.test.tsx`
 
 **Interfaces:**
+
 - Consumes: `serverEnvironment.sessionBriefLive`, `clearSessionBrief`, and `removeSessionBriefEntry` (Task 6), `formatSessionBriefText` (Task 2), `useCopyToClipboard` (`hooks/useCopyToClipboard.ts:195`), and `requestConfirmDialog` (`confirmDialog.ts:62`).
 - Produces: `SessionBriefPanel({ threadRef }: { threadRef: ScopedThreadRef })` and `SessionBriefTabTitle({ threadRef })`. The tab title renders `Brief · N`, or just `Brief` when N is 0.
 
 **Panel behavior:**
+
 - **Toolbar:** `N entries`, then a **Copy** button (primary), then a **Clear** button.
   - Copy writes `formatSessionBriefText(view.entries)` and shows "Copied" for 2 seconds.
   - Clear calls `requestConfirmDialog("Clear the session brief? The annual log keeps every entry.", { variant: "destructive" })`.
@@ -331,6 +359,7 @@ expect(formatSessionBriefText(entries)).toBe(
 ### Task 8: Log path setting UI, end-to-end check, finish
 
 **Files:**
+
 - Create: `apps/web/src/components/settings/SessionBriefSettings.tsx`. It is one `SettingsRow` using the `addProjectBaseDirectory` pattern at `SettingsPanels.tsx:1556-1587`, with `settingKeys={["sessionBriefLogPath"]}`.
   - Label: "Session brief log file".
   - Description: "Verified brief entries are appended here (Session-Briefs-Log.json). Leave empty to keep briefs without logging."

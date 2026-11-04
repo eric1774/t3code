@@ -80,6 +80,8 @@ import * as PeerLinks from "./peer/PeerLinks.ts";
 import * as PeerMcpClient from "./peer/PeerMcpClient.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
+import * as SessionBriefLog from "./sessionBrief/SessionBriefLog.ts";
+import * as SessionBriefService from "./sessionBrief/SessionBriefService.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DeviceHubProxy from "./device/DeviceHubProxy.ts";
 import * as PreviewManager from "./preview/Manager.ts";
@@ -1176,6 +1178,10 @@ const layerMakeServer = Layer.unwrap(
 
     return layerServerApplication.pipe(
       Layer.provide(CloudLink.layer.pipe(Layer.provideMerge(ConnectReachability.layer))),
+      // One instance for /mcp and WebSocket, so both share retry fibers and the change feed.
+      // Merged here (not just provided to the routes) because the WebSocket handlers
+      // read it from the request context.
+      Layer.provideMerge(SessionBriefService.layer.pipe(Layer.provide(SessionBriefLog.layer))),
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(

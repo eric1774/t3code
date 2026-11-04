@@ -8,6 +8,7 @@ import { mergeProviderInstanceEnvironment } from "@t3tools/provider-core/server/
 import { expandHomePath } from "@t3tools/provider-core/server/pathExpansion";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
+import { T3_SESSION_BRIEF_ENV } from "../../sessionBrief/claudeMarker.ts";
 import { readClaudeSettingsEnv } from "./ClaudeSkills.ts";
 
 const quotePath = Schema.encodeSync(Schema.fromJsonString(Schema.String));
@@ -74,6 +75,7 @@ export const mergeClaudeProcessEnvironment = Effect.fn("mergeClaudeProcessEnviro
   const baseEnvironment: NodeJS.ProcessEnv = {
     ...hostEnvironment,
     CLAUDE_CODE_ENTRYPOINT: "t3-code",
+    [T3_SESSION_BRIEF_ENV]: "1",
   };
   for (const name of CLAUDE_HOST_SESSION_VARIABLES) delete baseEnvironment[name];
   // The desktop runs the server as Node through Electron. Commands Claude runs inherit its env, so

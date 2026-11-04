@@ -695,6 +695,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["generated thread titles prompt custom style naming rename regenerate"],
   },
   {
+    id: "session-brief-log-path",
+    title: "Session brief log file",
+    to: "/settings/threads",
+    scope: "environment-defaults",
+    searchTerms: ["session brief verified entries append vault json log path"],
+  },
+  {
     id: "app-version",
     title: "Version",
     to: "/settings/about",

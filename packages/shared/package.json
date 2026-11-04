@@ -507,6 +507,10 @@
       "types": "./src/atomicWrite.ts",
       "import": "./src/atomicWrite.ts"
     },
+    "./sessionBriefText": {
+      "types": "./src/sessionBriefText.ts",
+      "import": "./src/sessionBriefText.ts"
+    },
     "./mcpResponsePayloads": {
       "types": "./src/mcpResponsePayloads.ts",
       "import": "./src/mcpResponsePayloads.ts"
